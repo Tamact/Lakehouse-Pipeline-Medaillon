@@ -1,0 +1,45 @@
+# =============================================================================
+#  Prometheus - supervision de la plateforme Data Lakehouse
+# =============================================================================
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    platform: dit-lakehouse
+
+scrape_configs:
+
+  # --- Prometheus lui-meme ------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # --- MinIO (metriques cluster, auth publique activee dans compose) ------
+  - job_name: minio
+    metrics_path: /minio/v2/metrics/cluster
+    scheme: http
+    static_configs:
+      - targets: ["minio:9000"]
+
+  # --- Nessie (Quarkus / Micrometer) -----------------------------------
+  - job_name: nessie
+    metrics_path: /q/metrics
+    static_configs:
+      - targets: ["nessie:19120"]
+
+  # --- Spark master / worker (metrics servlet, si activee) -------------
+  - job_name: spark
+    metrics_path: /metrics/prometheus
+    static_configs:
+      - targets: ["spark-master:8080", "spark-worker:8081"]
+
+  # --- Apache NiFi (BONUS Partie 7) ----------------------------------
+  #  Requiert un "PrometheusReportingTask" configure dans NiFi (port 9092).
+  #  Voir nifi/README.md section "Supervision".
+  - job_name: nifi
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets: ["nifi:9092"]
+    # NiFi peut mettre du temps a exposer l'endpoint : on tolere l'echec.
+    honor_labels: true

@@ -1,0 +1,40 @@
+# ---- Donnees & volumes locaux -------------------------------------------------
+data/
+volumes/
+*.log
+logs/
+
+# ---- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ---- Spark / Ivy / jars telecharges ---------------------------------------
+spark/jars/*.jar
+.ivy2/
+derby.log
+metastore_db/
+spark-warehouse/
+
+# ---- Airflow --------------------------------------------------------------
+airflow/logs/
+airflow/airflow.db
+airflow/webserver_config.py
+standalone_admin_password.txt
+
+# ---- Dremio -------------------------------------------------------------
+dremio-data/
+
+# ---- OS / IDE -----------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# ---- Secrets (garder .env.example versionne, pas .env) -----------------
+# .env est versionne ici volontairement pour la reproductibilite de la
+# correction (identifiants de demo uniquement, aucune donnee reelle).

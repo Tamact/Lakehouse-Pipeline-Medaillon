@@ -1,0 +1,2 @@
+# Contexte de build = ./docker : on ne veut que les Dockerfiles + scripts.
+**/*.md

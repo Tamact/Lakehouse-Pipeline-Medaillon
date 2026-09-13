@@ -1,0 +1,396 @@
+x-common-env: &common-env
+  TZ: ${TZ}
+
+networks:
+  lakehouse-net:
+    name: lakehouse-net
+    driver: bridge
+
+volumes:
+  postgres-data:
+  minio-data:
+  nifi-conf:
+  nifi-state:
+  nifi-repo-database:
+  nifi-repo-flowfile:
+  nifi-repo-content:
+  nifi-repo-provenance:
+  nifi-logs:
+  dremio-data:
+  prometheus-data:
+  grafana-data:
+  spark-events:
+
+services:
+
+  # ==========================================================================
+  #  1) PostgreSQL  -  metadonnees Airflow + version store Nessie
+  # ==========================================================================
+  postgres:
+    image: postgres:16
+    container_name: lakehouse-postgres
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: lakehouse
+      POSTGRES_AIRFLOW_DB: ${POSTGRES_AIRFLOW_DB}
+      POSTGRES_NESSIE_DB: ${POSTGRES_NESSIE_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d lakehouse" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [ lakehouse-net ]
+
+  # ==========================================================================
+  #  2) MinIO  -  stockage objet S3-compatible
+  # ==========================================================================
+  minio:
+    image: minio/minio:RELEASE.2024-08-17T01-24-54Z
+    container_name: lakehouse-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      <<: *common-env
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_REGION: ${MINIO_REGION}
+      MINIO_PROMETHEUS_AUTH_TYPE: public # expose /minio/v2/metrics/cluster sans token
+    volumes:
+      - minio-data:/data
+    ports:
+      - "${MINIO_API_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+    healthcheck:
+      test: [ "CMD-SHELL", "mc ready local || curl -f http://localhost:9000/minio/health/live || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [ lakehouse-net ]
+
+  # --- Creation des buckets (zone brute + warehouse) une seule fois ----------
+  minio-init:
+    image: minio/mc:RELEASE.2024-08-17T11-33-50Z
+    container_name: lakehouse-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      RAW_BUCKET: ${RAW_BUCKET}
+      WAREHOUSE_BUCKET: ${WAREHOUSE_BUCKET}
+    entrypoint: [ "/bin/sh", "/scripts/create-buckets.sh" ]
+    volumes:
+      - ./minio/init/create-buckets.sh:/scripts/create-buckets.sh:ro
+    networks: [ lakehouse-net ]
+    restart: "no"
+
+  # ==========================================================================
+  #  3) Project Nessie  -  catalogue versionne des tables Iceberg
+  #     Version store : JDBC -> base "nessie" de PostgreSQL
+  # ==========================================================================
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.99.0
+    container_name: lakehouse-nessie
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      NESSIE_VERSION_STORE_TYPE: JDBC
+      QUARKUS_DATASOURCE_DB_KIND: postgresql
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/${POSTGRES_NESSIE_DB}
+      QUARKUS_DATASOURCE_USERNAME: ${POSTGRES_USER}
+      QUARKUS_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
+      NESSIE_SERVER_DEFAULT_BRANCH: ${NESSIE_DEFAULT_BRANCH}
+      # Metriques Micrometer/Prometheus exposees sur /q/metrics
+      QUARKUS_MICROMETER_EXPORT_PROMETHEUS_ENABLED: "true"
+    ports:
+      - "${NESSIE_PORT}:19120"
+      - "9010:9000" # interface de management Quarkus (health/metrics)
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/q/health/live" ]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    networks: [ lakehouse-net ]
+
+  # ==========================================================================
+  #  4) Cluster Apache Spark  (1 master + 1 worker)
+  #     Image custom = spark:3.5.1 + jars Iceberg / Nessie / AWS (S3A)
+  # ==========================================================================
+  spark-master:
+    build:
+      context: ./docker
+      dockerfile: spark/Dockerfile
+    image: lakehouse/spark:3.5.1
+    container_name: lakehouse-spark-master
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      SPARK_MODE: master
+      SPARK_MASTER_HOST: spark-master
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master --port 7077 --webui-port 8080
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      nessie:
+        condition: service_healthy
+    volumes:
+      - ./spark/jobs:/opt/spark/jobs:ro
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - spark-events:/opt/spark/spark-events
+    ports:
+      - "${SPARK_MASTER_WEBUI_PORT}:8080"
+      - "${SPARK_MASTER_PORT}:7077"
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sf http://localhost:8080 || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [ lakehouse-net ]
+
+  spark-worker:
+    build:
+      context: ./docker
+      dockerfile: spark/Dockerfile
+    image: lakehouse/spark:3.5.1
+    container_name: lakehouse-spark-worker
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      SPARK_MODE: worker
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY}
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --cores ${SPARK_WORKER_CORES} --memory ${SPARK_WORKER_MEMORY} --webui-port 8081
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    volumes:
+      - ./spark/jobs:/opt/spark/jobs:ro
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - spark-events:/opt/spark/spark-events
+    ports:
+      - "${SPARK_WORKER_WEBUI_PORT}:8081"
+    networks: [ lakehouse-net ]
+
+  # ==========================================================================
+  #  5) Apache Airflow  (LocalExecutor)  -  orchestration du medaillon
+  #     Image custom = airflow 2.9 + client Spark 3.5.1 + provider Spark
+  # ==========================================================================
+  airflow-init:
+    build:
+      context: ./docker
+      dockerfile: airflow/Dockerfile
+    image: lakehouse/airflow:2.9.3
+    container_name: lakehouse-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USER}" --password "${AIRFLOW_ADMIN_PASSWORD}" \
+          --firstname Admin --lastname User --role Admin --email admin@dit.sn || true
+        airflow users create \
+          --username "${AIRFLOW_API_USER}" --password "${AIRFLOW_API_PASSWORD}" \
+          --firstname NiFi --lastname Trigger --role User --email nifi@dit.sn || true
+        airflow connections add spark_default \
+          --conn-type spark --conn-host "spark://spark-master" --conn-port 7077 || true
+        airflow connections add fakestore_api \
+          --conn-type http --conn-host "${FAKESTORE_API_BASE}" || true
+    environment: &airflow-env
+      <<: *common-env
+      AIRFLOW__CORE__EXECUTOR: ${AIRFLOW__CORE__EXECUTOR}
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_AIRFLOW_DB}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      AIRFLOW__METRICS__STATSD_ON: "false"
+      # Parametres fonctionnels lus par les DAGs
+      LAKEHOUSE_DOMAINS: ${LAKEHOUSE_DOMAINS}
+      BACKFILL_WEEKS: ${BACKFILL_WEEKS}
+      FAKESTORE_API_BASE: ${FAKESTORE_API_BASE}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      RAW_BUCKET: ${RAW_BUCKET}
+      WAREHOUSE_BUCKET: ${WAREHOUSE_BUCKET}
+      NESSIE_URI: ${NESSIE_URI}
+      SPARK_MASTER_URL: spark://spark-master:7077
+    volumes: &airflow-volumes
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./airflow/logs:/opt/airflow/logs
+      - ./spark/jobs:/opt/spark/jobs:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [ lakehouse-net ]
+    restart: "no"
+
+  airflow-webserver:
+    build:
+      context: ./docker
+      dockerfile: airflow/Dockerfile
+    image: lakehouse/airflow:2.9.3
+    container_name: lakehouse-airflow-webserver
+    restart: unless-stopped
+    command: webserver
+    environment: *airflow-env
+    volumes: *airflow-volumes
+    ports:
+      - "${AIRFLOW_WEBSERVER_PORT}:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/health" ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    networks: [ lakehouse-net ]
+
+  airflow-scheduler:
+    build:
+      context: ./docker
+      dockerfile: airflow/Dockerfile
+    image: lakehouse/airflow:2.9.3
+    container_name: lakehouse-airflow-scheduler
+    restart: unless-stopped
+    command: scheduler
+    environment:
+      <<: *airflow-env
+      # Le driver Spark (client mode) tourne DANS ce conteneur : il doit etre
+      # joignable par les executors du worker -> on fixe son hostname reseau.
+      SPARK_DRIVER_HOST: airflow-scheduler
+    volumes: *airflow-volumes
+    depends_on:
+      airflow-webserver:
+        condition: service_healthy
+      spark-master:
+        condition: service_healthy
+    networks: [ lakehouse-net ]
+
+  # ==========================================================================
+  #  6) Apache NiFi  -  unique point d'ingestion (FakeStoreAPI -> MinIO)
+  # ==========================================================================
+  nifi:
+    image: apache/nifi:1.28.1
+    container_name: lakehouse-nifi
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      # Acces "single-user" : HTTPS + login/mot de passe fixes (choix documente).
+      SINGLE_USER_CREDENTIALS_USERNAME: ${NIFI_USERNAME}
+      SINGLE_USER_CREDENTIALS_PASSWORD: ${NIFI_PASSWORD}
+      NIFI_WEB_HTTPS_PORT: "8443"
+      NIFI_WEB_HTTPS_HOST: "0.0.0.0"
+      NIFI_WEB_PROXY_HOST: "localhost:${NIFI_WEB_HTTPS_PORT},nifi:8443"
+      NIFI_SENSITIVE_PROPS_KEY: ${NIFI_SENSITIVE_PROPS_KEY}
+      # Reporting task Prometheus (bonus supervision) sur le port 9092
+      NIFI_ANALYTICS_PREDICT_ENABLED: "true"
+    ports:
+      - "${NIFI_WEB_HTTPS_PORT}:8443"
+      - "9092:9092" # PrometheusReportingTask (bonus)
+    volumes:
+      - nifi-conf:/opt/nifi/nifi-current/conf
+      - nifi-state:/opt/nifi/nifi-current/state
+      - nifi-repo-database:/opt/nifi/nifi-current/database_repository
+      - nifi-repo-flowfile:/opt/nifi/nifi-current/flowfile_repository
+      - nifi-repo-content:/opt/nifi/nifi-current/content_repository
+      - nifi-repo-provenance:/opt/nifi/nifi-current/provenance_repository
+      - nifi-logs:/opt/nifi/nifi-current/logs
+      - ./nifi/flow:/opt/nifi/flow-import:ro # gabarit de flow a importer
+      - ./nifi/scripts:/opt/nifi/custom-scripts:ro # scripts utilitaires (backfill)
+    healthcheck:
+      # L'image NiFi n'embarque pas curl : test TCP sur le port HTTPS via bash.
+      test: [ "CMD-SHELL", "bash -c '</dev/tcp/localhost/8443' 2>/dev/null || exit 1" ]
+      interval: 20s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+    networks: [ lakehouse-net ]
+
+  # ==========================================================================
+  #  7) Dremio OSS  -  moteur de requete SQL du lakehouse
+  # ==========================================================================
+  dremio:
+    image: dremio/dremio-oss:25.0
+    container_name: lakehouse-dremio
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      DREMIO_JAVA_SERVER_EXTRA_OPTS: >-
+        -Dpaths.dist=file:///opt/dremio/data/dist -Ddebug.addDefaultUser=true
+    ports:
+      - "${DREMIO_HTTP_PORT}:9047"
+      - "${DREMIO_CLIENT_PORT}:31010"
+      - "${DREMIO_FLIGHT_PORT}:32010"
+    volumes:
+      - dremio-data:/opt/dremio/data
+    depends_on:
+      nessie:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sf http://localhost:9047 >/dev/null || exit 1" ]
+      interval: 20s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+    networks: [ lakehouse-net ]
+
+  # ==========================================================================
+  #  8) Prometheus + Grafana  -  supervision de l'infrastructure
+  # ==========================================================================
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: lakehouse-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    ports:
+      - "${PROMETHEUS_PORT}:9090"
+    networks: [ lakehouse-net ]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: lakehouse-grafana
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT}:3000"
+    depends_on:
+      - prometheus
+    networks: [ lakehouse-net ]

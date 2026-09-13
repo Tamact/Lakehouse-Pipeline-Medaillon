@@ -1,0 +1,57 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 0,
+  "title": "Lakehouse - Vue d'ensemble infrastructure",
+  "uid": "lakehouse-overview",
+  "tags": ["lakehouse", "dit"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "30s",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Cibles Prometheus UP",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "targets": [ { "expr": "count(up == 1)", "refId": "A" } ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 3 } ] } }, "overrides": [] }
+    },
+    {
+      "type": "stat",
+      "title": "Etat des services",
+      "gridPos": { "h": 6, "w": 18, "x": 6, "y": 0 },
+      "targets": [ { "expr": "up", "legendFormat": "{{job}} ({{instance}})", "refId": "A" } ],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name" },
+      "fieldConfig": { "defaults": { "mappings": [ { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } } ] }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "NiFi - FlowFiles en file d'attente (BONUS)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [ { "expr": "nifi_amount_flowfiles_queued", "legendFormat": "{{component_name}}", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "NiFi - Octets lus / ecrits par les processeurs (BONUS)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        { "expr": "rate(nifi_amount_bytes_read[5m])", "legendFormat": "read {{component_name}}", "refId": "A" },
+        { "expr": "rate(nifi_amount_bytes_written[5m])", "legendFormat": "written {{component_name}}", "refId": "B" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "MinIO - Objets par bucket",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "targets": [ { "expr": "minio_bucket_usage_object_total", "legendFormat": "{{bucket}}", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Nessie - Requetes HTTP (rate)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "targets": [ { "expr": "rate(http_server_requests_seconds_count{job=\"nessie\"}[5m])", "legendFormat": "{{method}} {{uri}}", "refId": "A" } ]
+    }
+  ]
+}
